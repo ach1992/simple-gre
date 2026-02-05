@@ -36,7 +36,7 @@ Repo: https://github.com/ach1992/simple-gre
 Run this on **both servers**:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ach1992/simple-gre/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ach1992/simple-gre/main/install.sh | sudo bash && sudo simple-gre
 ```
 
 Run the manager:
