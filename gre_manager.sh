@@ -107,6 +107,36 @@ tunnel_exists_in_conf() {
   [[ -f "$(conf_path_for "$tun")" ]]
 }
 
+name_taken() {
+  local tun="$1"
+  # taken if config exists OR interface exists on system
+  if tunnel_exists_in_conf "$tun"; then
+    return 0
+  fi
+  if ip link show "$tun" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+find_first_free_gre_name() {
+  local base="${1:-gre}"
+  local i=1
+  local cand
+  while true; do
+    cand="${base}${i}"
+    if ! name_taken "$cand"; then
+      echo "$cand"
+      return 0
+    fi
+    i=$((i+1))
+    # safety guard (practically never hit)
+    if (( i > 4096 )); then
+      return 1
+    fi
+  done
+}
+
 # -------------------------
 # PAIR CODE + COPY BLOCK
 # -------------------------
@@ -576,42 +606,30 @@ prompt_role() {
 }
 
 prompt_tun_name_new() {
-  local inp
+  local inp chosen
+
   read -r -p "Tunnel interface name [${TUN_NAME_DEFAULT}]: " inp || true
   inp="${inp:-$TUN_NAME_DEFAULT}"
-  is_ifname "$inp" || { err "Invalid interface name."; return 1; }
-  if tunnel_exists_in_conf "$inp"; then
-    err "Tunnel '$inp' already exists in configs."
-    return 1
-  fi
-  if ip link show "$inp" >/dev/null 2>&1; then
-    err "Interface '$inp' already exists in the system. Choose another name or delete it."
-    return 1
-  fi
-  TUN_NAME="$inp"
-  return 0
-}
 
-prompt_tun_name_keep() {
-  local inp
-  read -r -p "Tunnel interface name [${TUN_NAME}]: " inp || true
-  inp="${inp:-$TUN_NAME}"
   is_ifname "$inp" || { err "Invalid interface name."; return 1; }
 
-  # If renamed, ensure no conflicts
-  if [[ "$inp" != "$TUN_NAME" ]]; then
-    if tunnel_exists_in_conf "$inp"; then
-      err "Tunnel '$inp' already exists in configs."
-      return 1
-    fi
-    if ip link show "$inp" >/dev/null 2>&1; then
-      err "Interface '$inp' already exists in the system."
-      return 1
-    fi
+  # If the requested name is free, accept it
+  if ! name_taken "$inp"; then
+    TUN_NAME="$inp"
+    return 0
   fi
 
-  TUN_NAME="$inp"
-  return 0
+  # If name is taken, auto-pick next free ONLY for greN pattern (safe + predictable)
+  if [[ "$inp" =~ ^gre[0-9]+$ ]] || [[ "$inp" == "gre" ]]; then
+    chosen="$(find_first_free_gre_name "gre")" || { err "Could not find a free greN name."; return 1; }
+    warn "Tunnel name '${inp}' is already taken. Auto-selected: ${chosen}"
+    TUN_NAME="$chosen"
+    return 0
+  fi
+
+  # For custom names (not greN), don't guess; user should choose another
+  err "Tunnel name '${inp}' is already taken. Please choose another name."
+  return 1
 }
 
 prompt_local_wan_ip_keep() {
