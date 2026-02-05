@@ -36,7 +36,6 @@ apt_install_required() {
 }
 
 apt_install_optional() {
-  # Optional tools for troubleshooting only
   export DEBIAN_FRONTEND=noninteractive
   if ! have_cmd tcpdump; then
     log "Installing optional package: tcpdump (best effort)"
@@ -72,10 +71,7 @@ main() {
     exit 1
   fi
 
-  # Required deps
   apt_install_required
-
-  # Optional deps (never fail install)
   apt_install_optional
 
   download_script
