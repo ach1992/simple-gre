@@ -258,14 +258,31 @@ prompt_remote_wan_ip() {
 
 prompt_tunnel_ips() {
   echo "Tunnel addressing:"
-  echo "  - Recommended: use a /30 (2 usable IPs)."
-  echo "  - Press Enter to auto-generate a private /30."
+  echo "  - We will use a random private /30."
+  echo "  - On the first server, press Enter to auto-generate."
+  echo "  - Copy the shown PAIR CODE and paste it on the second server."
 
-  # Generate a random 10.X.Y.0/30 (avoid 0 and 255)
-  local rx ry base_net
-  rx=$(( (RANDOM % 254) + 1 ))
-  ry=$(( (RANDOM % 254) + 1 ))
-  base_net="10.${rx}.${ry}.0/30"
+  local pair_code=""
+  read -r -p "PAIR CODE (press Enter to auto-generate): " pair_code || true
+
+  local rx ry
+  if [[ -z "${pair_code:-}" ]]; then
+    rx=$(( (RANDOM % 254) + 1 ))
+    ry=$(( (RANDOM % 254) + 1 ))
+    pair_code="10.${rx}.${ry}"
+  else
+    # Expected format: 10.X.Y
+    if [[ ! "$pair_code" =~ ^10\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+      err "Invalid PAIR CODE format. Example: 10.83.41"
+      return 1
+    fi
+    rx="${BASH_REMATCH[1]}"
+    ry="${BASH_REMATCH[2]}"
+    if (( rx < 0 || rx > 255 || ry < 0 || ry > 255 )); then
+      err "PAIR CODE octets must be between 0 and 255."
+      return 1
+    fi
+  fi
 
   local def_local def_remote
   if [[ "${ROLE}" == "source" ]]; then
@@ -276,27 +293,14 @@ prompt_tunnel_ips() {
     def_remote="10.${rx}.${ry}.1"
   fi
 
-  local local_cidr remote_ip
+  TUN_LOCAL_CIDR="$def_local"
+  TUN_REMOTE_IP="$def_remote"
 
-  read -r -p "Local tunnel IPv4/CIDR [${def_local}]: " local_cidr || true
-  local_cidr="${local_cidr:-$def_local}"
-  if ! is_cidr "$local_cidr"; then
-    err "Invalid CIDR."
-    return 1
-  fi
-
-  read -r -p "Remote tunnel IPv4 [${def_remote}]: " remote_ip || true
-  remote_ip="${remote_ip:-$def_remote}"
-  if ! is_ipv4 "$remote_ip"; then
-    err "Invalid IPv4 address."
-    return 1
-  fi
-
-  TUN_LOCAL_CIDR="$local_cidr"
-  TUN_REMOTE_IP="$remote_ip"
-
-  # Helpful note:
-  echo "Note: Auto-generated /30 base network: ${base_net}"
+  echo
+  echo "PAIR CODE: ${pair_code}"
+  echo "Local tunnel:  ${TUN_LOCAL_CIDR}"
+  echo "Remote tunnel: ${TUN_REMOTE_IP}"
+  echo
 }
 
 prompt_mtu_ttl() {
