@@ -27,12 +27,9 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-# Only install missing deps. Avoid apt-get update unless needed.
 install_missing_deps_if_possible() {
   local missing=()
-  # For installer: curl required to download
   have_cmd curl || missing+=("curl")
-  # For runtime: ip + ping required
   have_cmd ip   || missing+=("iproute2")
   have_cmd ping || missing+=("iputils-ping")
 
@@ -53,7 +50,6 @@ install_missing_deps_if_possible() {
 
   export DEBIAN_FRONTEND=noninteractive
 
-  # Try install without apt-get update first (often avoids repo/DNS issues).
   if apt-get install -y "${missing[@]}"; then
     ok "Installed missing dependencies without apt-get update."
     return 0
@@ -62,7 +58,6 @@ install_missing_deps_if_possible() {
   warn "Install failed without apt-get update."
   warn "Trying: apt-get update (best effort) then install missing packages..."
 
-  # Best effort update + install
   if apt-get update -y && apt-get install -y "${missing[@]}"; then
     ok "Installed missing dependencies after apt-get update."
     return 0
@@ -91,7 +86,6 @@ cleanup() { rm -rf "$TMP_DIR" >/dev/null 2>&1 || true; }
 
 main() {
   need_root
-
   install_missing_deps_if_possible
 
   download_script
