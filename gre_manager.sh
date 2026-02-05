@@ -258,15 +258,35 @@ prompt_remote_wan_ip() {
 
 prompt_tunnel_ips() {
   echo "Tunnel addressing:"
-  echo "  - Recommended: use a /30, e.g. 10.10.10.1/30 and 10.10.10.2"
+  echo "  - Recommended: use a /30 (2 usable IPs)."
+  echo "  - Press Enter to auto-generate a private /30."
+
+  # Generate a random 10.X.Y.0/30 (avoid 0 and 255)
+  local rx ry base_net
+  rx=$(( (RANDOM % 254) + 1 ))
+  ry=$(( (RANDOM % 254) + 1 ))
+  base_net="10.${rx}.${ry}.0/30"
+
+  local def_local def_remote
+  if [[ "${ROLE}" == "source" ]]; then
+    def_local="10.${rx}.${ry}.1/30"
+    def_remote="10.${rx}.${ry}.2"
+  else
+    def_local="10.${rx}.${ry}.2/30"
+    def_remote="10.${rx}.${ry}.1"
+  fi
+
   local local_cidr remote_ip
-  read -r -p "Local tunnel IPv4/CIDR (e.g. 10.10.10.1/30): " local_cidr
+
+  read -r -p "Local tunnel IPv4/CIDR [${def_local}]: " local_cidr || true
+  local_cidr="${local_cidr:-$def_local}"
   if ! is_cidr "$local_cidr"; then
     err "Invalid CIDR."
     return 1
   fi
 
-  read -r -p "Remote tunnel IPv4 (e.g. 10.10.10.2): " remote_ip
+  read -r -p "Remote tunnel IPv4 [${def_remote}]: " remote_ip || true
+  remote_ip="${remote_ip:-$def_remote}"
   if ! is_ipv4 "$remote_ip"; then
     err "Invalid IPv4 address."
     return 1
@@ -274,6 +294,9 @@ prompt_tunnel_ips() {
 
   TUN_LOCAL_CIDR="$local_cidr"
   TUN_REMOTE_IP="$remote_ip"
+
+  # Helpful note:
+  echo "Note: Auto-generated /30 base network: ${base_net}"
 }
 
 prompt_mtu_ttl() {
