@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # =========================
-#  Simple Gre - GRE Manager (Multi Tunnel)
+#  Simple Gre - GRE Manager (Multi Tunnel) - FINAL
 #  Repo: https://github.com/ach1992/simple-gre
 # =========================
 # Debian/Ubuntu friendly (systemd)
@@ -15,11 +15,11 @@ set -Eeuo pipefail
 # - Fixes rp_filter + forwarding safely and persists via sysctl.d
 #
 # Notes:
-# - GRE requires IP protocol 47 allowed between public IPs.
+# - GRE requires IP protocol 47 allowed between public IPs.											   
 
 APP_DIR="/etc/simple-gre"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
-LEGACY_CONF_FILE="$APP_DIR/gre.conf"              # old single-tunnel config
+LEGACY_CONF_FILE="$APP_DIR/gre.conf"
 SYSCTL_FILE="$APP_DIR/99-simple-gre.conf"
 SERVICE_TEMPLATE_FILE="/etc/systemd/system/simple-gre@.service"
 
@@ -107,9 +107,11 @@ tunnel_exists_in_conf() {
   [[ -f "$(conf_path_for "$tun")" ]]
 }
 
+# -------------------------
+# Name auto-pick (greN)
+# -------------------------
 name_taken() {
   local tun="$1"
-  # taken if config exists OR interface exists on system
   if tunnel_exists_in_conf "$tun"; then
     return 0
   fi
@@ -130,7 +132,6 @@ find_first_free_gre_name() {
       return 0
     fi
     i=$((i+1))
-    # safety guard (practically never hit)
     if (( i > 4096 )); then
       return 1
     fi
@@ -195,7 +196,6 @@ print_copy_block() {
   echo "----- END_COPY_BLOCK -----"
 }
 
-# Double-Enter paste input:
 prompt_paste_copy_block() {
   echo -e "${CYA}Optional:${NC} Paste COPY BLOCK now (press Enter to skip)."
   echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
@@ -287,7 +287,7 @@ prompt_paste_copy_block() {
 }
 
 # -------------------------
-# Config I/O (per tunnel)
+# Config I/O
 # -------------------------
 read_conf() {
   local tun="$1"
@@ -365,7 +365,7 @@ choose_tunnel() {
 }
 
 # -------------------------
-# Sysctl (global persist from all tunnels)
+# Sysctl persist (global from all tunnels)
 # -------------------------
 compute_global_forwarding_needed() {
   local t need="no"
@@ -412,7 +412,6 @@ write_sysctl_persist() {
       local t
       while IFS= read -r t; do
         [[ -z "$t" ]] && continue
-        # per-interface
         echo "net.ipv4.conf.${t}.rp_filter=0"
       done < <(list_tunnels)
     fi
@@ -423,10 +422,9 @@ write_sysctl_persist() {
 }
 
 # -------------------------
-# systemd + up/down scripts (shared)
+# systemd template + up/down (ALWAYS overwrite to avoid stale legacy versions)
 # -------------------------
 ensure_systemd_template() {
-  # Always (re)write template service + scripts to avoid stale legacy versions
   cat >"$SERVICE_TEMPLATE_FILE" <<'EOF'
 [Unit]
 Description=Simple Gre - GRE Tunnel (%i)
@@ -464,6 +462,7 @@ apply_sysctl() {
     sysctl --system >/dev/null 2>&1 || true
   fi
 
+  # Never force-disable forwarding here; only enable if this tunnel needs it.
   if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   fi
@@ -539,11 +538,10 @@ stop_disable_tunnel_service() {
 }
 
 # -------------------------
-# Migration (legacy -> multi)
+# Migration (legacy single -> multi)
 # -------------------------
 migrate_legacy_if_needed() {
   ensure_dirs
-  # If tunnels exist, no migration needed
   local any
   any="$(list_tunnels | head -n1 || true)"
   if [[ -n "${any:-}" ]]; then
@@ -557,11 +555,7 @@ migrate_legacy_if_needed() {
     # shellcheck disable=SC1090
     source "$LEGACY_CONF_FILE"
 
-    # Ensure name
-    if [[ -z "${TUN_NAME:-}" ]]; then
-      TUN_NAME="$TUN_NAME_DEFAULT"
-    fi
-    if ! is_ifname "$TUN_NAME"; then
+    if [[ -z "${TUN_NAME:-}" ]] || ! is_ifname "${TUN_NAME:-}"; then
       TUN_NAME="$TUN_NAME_DEFAULT"
     fi
 
@@ -597,19 +591,16 @@ prompt_role() {
 
 prompt_tun_name_new() {
   local inp chosen
-
   read -r -p "Tunnel interface name [${TUN_NAME_DEFAULT}]: " inp || true
   inp="${inp:-$TUN_NAME_DEFAULT}"
 
   is_ifname "$inp" || { err "Invalid interface name."; return 1; }
 
-  # If the requested name is free, accept it
   if ! name_taken "$inp"; then
     TUN_NAME="$inp"
     return 0
   fi
 
-  # If name is taken, auto-pick next free ONLY for greN pattern (safe + predictable)
   if [[ "$inp" =~ ^gre[0-9]+$ ]] || [[ "$inp" == "gre" ]]; then
     chosen="$(find_first_free_gre_name "gre")" || { err "Could not find a free greN name."; return 1; }
     warn "Tunnel name '${inp}' is already taken. Auto-selected: ${chosen}"
@@ -617,9 +608,25 @@ prompt_tun_name_new() {
     return 0
   fi
 
-  # For custom names (not greN), don't guess; user should choose another
   err "Tunnel name '${inp}' is already taken. Please choose another name."
   return 1
+}
+
+prompt_tun_name_keep() {
+  local inp
+  read -r -p "Tunnel interface name [${TUN_NAME}]: " inp || true
+  inp="${inp:-$TUN_NAME}"
+  is_ifname "$inp" || { err "Invalid interface name."; return 1; }
+
+  if [[ "$inp" != "$TUN_NAME" ]]; then
+    if name_taken "$inp"; then
+      err "Tunnel/interface name '${inp}' is already taken."
+      return 1
+    fi
+  fi
+
+  TUN_NAME="$inp"
+  return 0
 }
 
 prompt_local_wan_ip_keep() {
@@ -770,17 +777,14 @@ do_create() {
   PASTE_SOURCE_PUBLIC_IP=""
   PASTE_DEST_PUBLIC_IP=""
 
-  # Optional paste
   if ! prompt_paste_copy_block; then
     err "Failed to parse COPY BLOCK."
     return
   fi
   echo
 
-  # Choose/validate tunnel name (new)
   prompt_tun_name_new || return
 
-  # If pasted public IPs, swap based on role
   if [[ -n "${PASTE_SOURCE_PUBLIC_IP:-}" && -n "${PASTE_DEST_PUBLIC_IP:-}" ]]; then
     if [[ "${ROLE}" == "source" ]]; then
       LOCAL_WAN_IP="${PASTE_SOURCE_PUBLIC_IP}"
@@ -795,7 +799,6 @@ do_create() {
   prompt_local_wan_ip_keep || return
   prompt_remote_wan_ip_keep || return
   prompt_pair_code_keep || return
-
   recompute_tunnel_ips_from_pair || return
 
   prompt_numbers_keep || return
@@ -857,10 +860,9 @@ do_edit() {
     PAIR_CODE="$(generate_pair_code)"
     ok "Generated PAIR CODE: ${PAIR_CODE}"
   fi
-
   recompute_tunnel_ips_from_pair || return
 
-  local prev_ifname="${TUN_NAME}"
+  local prev_name="$TUN_NAME"
 
   prompt_tun_name_keep || return
   prompt_local_wan_ip_keep || return
@@ -868,11 +870,9 @@ do_edit() {
   prompt_numbers_keep || return
   prompt_tuning_keep || return
 
-  # If interface name changed, we should stop old service + remove old interface safely
-  # and also rename config file entry.
   if [[ "$TUN_NAME" != "$old_tun" ]]; then
     warn "Tunnel name changed: $old_tun -> $TUN_NAME"
-    warn "Stopping old service and removing old interface if exists..."
+    warn "Stopping old service + removing old interface if present..."
     stop_disable_tunnel_service "$old_tun"
     ip link set "$old_tun" down >/dev/null 2>&1 || true
     ip tunnel del "$old_tun" >/dev/null 2>&1 || true
@@ -996,7 +996,6 @@ do_delete() {
   ip tunnel del "$tun" >/dev/null 2>&1 || true
 
   write_sysctl_persist
-
   ok "Deleted tunnel '$tun'."
 }
 
