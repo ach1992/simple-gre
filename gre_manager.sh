@@ -10,16 +10,18 @@ set -Eeuo pipefail
 # - Create/Edit/Status/Info/Delete GRE tunnel
 # - Defaults on Enter for most prompts
 # - Auto-generates a PAIR CODE (10.X.Y) for tunnel /30 addressing
-# - COPY BLOCK output to paste on the other server (no END line needed)
+# - COPY BLOCK output to paste on the other server
+#   -> Finish paste by pressing Enter TWICE on empty lines
+# - Fixes rp_filter automatically (common GRE ping issue)
+#   -> Applies immediately + persists with sysctl.d
 # - Persists with systemd service
 #
 # Notes:
 # - GRE requires IP protocol 47 allowed between public IPs.
-# - This script creates GRE interface + assigns tunnel IP.
-# - Routing/NAT for other subnets is not automatically added.
 
 APP_DIR="/etc/simple-gre"
 CONF_FILE="$APP_DIR/gre.conf"
+SYSCTL_FILE="$APP_DIR/99-simple-gre.conf"
 SERVICE_FILE="/etc/systemd/system/simple-gre.service"
 TUN_NAME_DEFAULT="gre1"
 
@@ -112,6 +114,22 @@ EOF
   chmod 600 "$CONF_FILE"
 }
 
+# Persist sysctl fixes (especially rp_filter for the tunnel IF)
+write_sysctl_persist() {
+  mkdir -p "$APP_DIR"
+  cat >"$SYSCTL_FILE" <<EOF
+# Simple Gre sysctl (persist)
+net.ipv4.ip_forward=$( [[ "${ENABLE_FORWARDING}" == "yes" ]] && echo 1 || echo 0 )
+# rp_filter off (recommended for GRE)
+net.ipv4.conf.all.rp_filter=0
+net.ipv4.conf.default.rp_filter=0
+net.ipv4.conf.${TUN_NAME}.rp_filter=0
+EOF
+  chmod 644 "$SYSCTL_FILE"
+  # make it active now
+  sysctl --system >/dev/null 2>&1 || true
+}
+
 create_systemd_service() {
   cat >"$SERVICE_FILE" <<'EOF'
 [Unit]
@@ -129,27 +147,47 @@ ExecStop=/usr/local/sbin/simple-gre-down
 WantedBy=multi-user.target
 EOF
 
+  # Up script
   cat >/usr/local/sbin/simple-gre-up <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 APP_DIR="/etc/simple-gre"
 CONF_FILE="$APP_DIR/gre.conf"
+SYSCTL_FILE="$APP_DIR/99-simple-gre.conf"
 [[ -f "$CONF_FILE" ]] || { echo "Config not found: $CONF_FILE" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CONF_FILE"
 
 apply_sysctl() {
-  if [[ "${ENABLE_FORWARDING}" == "yes" ]]; then
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  # Apply persistent sysctl first if present
+  if [[ -f "$SYSCTL_FILE" ]]; then
+    sysctl --system >/dev/null 2>&1 || true
   fi
+
+  if [[ "${ENABLE_FORWARDING}" == "yes" ]]; then
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null || true
+  fi
+
   if [[ "${DISABLE_RPFILTER}" == "yes" ]]; then
-    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null
-    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null
+    sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+    sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null || true
+  fi
+}
+
+enforce_iface_rpfilter() {
+  # IMPORTANT: Some providers reset rp_filter on newly-created interfaces.
+  # Enforce AFTER creating & bringing the interface UP.
+  if [[ "${DISABLE_RPFILTER}" == "yes" ]]; then
+    sysctl -w "net.ipv4.conf.${TUN_NAME}.rp_filter=0" >/dev/null 2>&1 || true
   fi
 }
 
 create_tunnel() {
+  # If exists, ensure it's up + settings, then return
   if ip link show "${TUN_NAME}" >/dev/null 2>&1; then
+    ip link set "${TUN_NAME}" mtu "${MTU}" >/dev/null 2>&1 || true
+    ip link set "${TUN_NAME}" up >/dev/null 2>&1 || true
+    enforce_iface_rpfilter
     exit 0
   fi
 
@@ -158,15 +196,14 @@ create_tunnel() {
   ip addr add "${TUN_LOCAL_CIDR}" dev "${TUN_NAME}"
   ip link set "${TUN_NAME}" up
 
-  if [[ "${DISABLE_RPFILTER}" == "yes" ]]; then
-    sysctl -w "net.ipv4.conf.${TUN_NAME}.rp_filter=0" >/dev/null || true
-  fi
+  enforce_iface_rpfilter
 }
 
 apply_sysctl
 create_tunnel
 EOF
 
+  # Down script
   cat >/usr/local/sbin/simple-gre-down <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -234,7 +271,6 @@ recompute_tunnel_ips_from_pair() {
 }
 
 print_copy_block() {
-  # Print public IPs as SOURCE_PUBLIC_IP / DEST_PUBLIC_IP for easy swap on the other side
   local src_ip dst_ip
   if [[ "${ROLE}" == "source" ]]; then
     src_ip="${LOCAL_WAN_IP}"
@@ -254,39 +290,45 @@ print_copy_block() {
   echo "ENABLE_FORWARDING=${ENABLE_FORWARDING}"
   echo "DISABLE_RPFILTER=${DISABLE_RPFILTER}"
   echo "----- END_COPY_BLOCK -----"
-  echo
-  echo "Tip: Paste on the other server, then press Enter on an EMPTY LINE."
 }
 
-# No END line required: user pastes block and then presses Enter on an empty line.
+# Double-Enter paste input:
+# - User pastes block
+# - Then presses Enter TWICE on empty lines to finish
+# - If user presses only once, show a clear hint (no "stuck" feeling)
 prompt_paste_copy_block() {
   echo -e "${CYA}Optional:${NC} Paste COPY BLOCK now (press Enter to skip)."
-  echo "After pasting, press Enter on an EMPTY LINE to finish."
+  echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
+  echo -e "${YEL}Example:${NC} Paste the block, then press Enter, then press Enter again."
   echo
 
-  local first
-  read -r -p "Paste first line (or just Enter): " first || true
+  local first=""
+  read -r -p "Paste first line (or just Enter to skip): " first || true
   if [[ -z "${first:-}" ]]; then
     return 0
   fi
 
-  # Collect lines until an empty line
   local lines=()
   lines+=("$first")
+
+  local empty_count=0
   while true; do
     local line=""
     read -r line || true
-    # empty line ends paste
-    if [[ -z "${line:-}" ]]; then
-      break
-    fi
-    lines+=("$line")
-  done
 
-  # Basic marker check (not mandatory, but helpful)
-  local has_marker="no"
-  for line in "${lines[@]}"; do
-    [[ "$line" == "----- SIMPLE_GRE_COPY_BLOCK -----" ]] && has_marker="yes"
+    if [[ -z "${line:-}" ]]; then
+      empty_count=$((empty_count + 1))
+      if (( empty_count == 1 )); then
+        echo -e "${YEL}Almost done:${NC} press Enter one more time to finish paste."
+      fi
+      if (( empty_count >= 2 )); then
+        break
+      fi
+      continue
+    fi
+
+    empty_count=0
+    lines+=("$line")
   done
 
   # Parse key=value
@@ -342,11 +384,7 @@ prompt_paste_copy_block() {
     return 1
   fi
 
-  if [[ "$has_marker" == "yes" ]]; then
-    ok "COPY BLOCK detected and parsed."
-  else
-    ok "Pasted values parsed (no marker detected, but OK)."
-  fi
+  ok "COPY BLOCK parsed successfully."
   return 0
 }
 
@@ -481,11 +519,13 @@ show_info() {
   echo "IPv4 forwarding:     ${ENABLE_FORWARDING:-N/A}"
   echo "rp_filter disabled:  ${DISABLE_RPFILTER:-N/A}"
   echo "Config file:         ${CONF_FILE}"
+  echo "Sysctl file:         ${SYSCTL_FILE}"
   echo "Service:             simple-gre.service"
   echo
 
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
   print_copy_block
+  echo -e "${YEL}Finish paste on the other server:${NC} Press Enter twice on empty lines."
 }
 
 do_create() {
@@ -507,7 +547,7 @@ do_create() {
   PASTE_SOURCE_PUBLIC_IP=""
   PASTE_DEST_PUBLIC_IP=""
 
-  # Optional paste
+  # Optional paste (double-enter finish)
   if ! prompt_paste_copy_block; then
     err "Failed to parse COPY BLOCK."
     return
@@ -542,6 +582,7 @@ do_create() {
   fi
 
   write_conf
+  write_sysctl_persist
   create_systemd_service
   apply_now
 
@@ -554,6 +595,7 @@ do_create() {
   echo
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
   print_copy_block
+  echo -e "${YEL}Finish paste on the other server:${NC} Press Enter twice on empty lines."
 }
 
 do_edit() {
@@ -580,8 +622,11 @@ do_edit() {
 
   read -r -p "PAIR CODE [${PAIR_CODE:-N/A}] (Enter=keep, empty auto-generate): " inp || true
   if [[ -n "${inp:-}" ]]; then
-    parse_pair_code "$inp" >/dev/null || { err "Invalid PAIR CODE. Keeping existing."; }
-    if parse_pair_code "$inp" >/dev/null; then PAIR_CODE="$inp"; fi
+    if parse_pair_code "$inp" >/dev/null; then
+      PAIR_CODE="$inp"
+    else
+      err "Invalid PAIR CODE. Keeping existing."
+    fi
   fi
   if [[ -z "${PAIR_CODE:-}" ]]; then
     PAIR_CODE="$(generate_pair_code)"
@@ -596,12 +641,14 @@ do_edit() {
   prompt_tuning_keep || return
 
   write_conf
+  write_sysctl_persist
   systemctl daemon-reload
   apply_now
   ok "Configuration updated and applied."
   echo
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
   print_copy_block
+  echo -e "${YEL}Finish paste on the other server:${NC} Press Enter twice on empty lines."
 }
 
 do_status() {
@@ -627,6 +674,10 @@ do_status() {
   ip -4 addr show dev "$TUN_NAME" || true
   echo
 
+  echo -e "${WHT}rp_filter (common GRE issue):${NC}"
+  sysctl "net.ipv4.conf.${TUN_NAME}.rp_filter" 2>/dev/null || true
+  echo
+
   echo -e "${WHT}Counters (traffic flow indicator):${NC}"
   ip -s link show "$TUN_NAME" || true
   echo
@@ -636,7 +687,9 @@ do_status() {
     ok "Ping successful. Tunnel looks UP and reachable."
   else
     warn "Ping failed."
-    warn "Check: both sides are up, protocol 47 (GRE) allowed, public IPs correct, firewall rules."
+    warn "If GRE packets arrive but ping fails, check rp_filter:"
+    warn "  sysctl net.ipv4.conf.${TUN_NAME}.rp_filter  (should be 0)"
+    warn "This script persists rp_filter=0, but some providers override it."
   fi
 }
 
@@ -644,7 +697,7 @@ do_delete() {
   if [[ -f "$CONF_FILE" ]]; then
     # shellcheck disable=SC1090
     source "$CONF_FILE"
-    warn "This will remove the GRE tunnel, systemd service, and config."
+    warn "This will remove the GRE tunnel, systemd service, sysctl file, and config."
     local yn
     read -r -p "Are you sure? [y/N]: " yn || true
     yn="${yn:-N}"
@@ -654,7 +707,7 @@ do_delete() {
     fi
 
     remove_service_and_scripts
-    rm -f "$CONF_FILE"
+    rm -f "$CONF_FILE" "$SYSCTL_FILE"
     rmdir "$APP_DIR" >/dev/null 2>&1 || true
 
     ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
