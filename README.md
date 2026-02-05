@@ -31,7 +31,7 @@ Repo: https://github.com/ach1992/simple-gre
 
 ---
 
-## Quick Install
+## Quick Install and Run
 
 Run this on **both servers**:
 
