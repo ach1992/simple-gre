@@ -6,7 +6,7 @@ A simple **menu-driven** Bash script to create and manage **multiple GRE tunnels
 
 ## What’s New (Multi‑Tunnel)
 
-- ✅ **Multiple tunnels** on the same server (e.g., Iran hub → many abroad servers)
+- ✅ **Multiple tunnels** on the same server (e.g., Iran hub → many Kharej servers)
 - ✅ Per-tunnel configs:
   - `/etc/simple-gre/tunnels.d/<TUN_NAME>.conf`
 - ✅ systemd **template service** per tunnel:
@@ -46,7 +46,7 @@ A simple **menu-driven** Bash script to create and manage **multiple GRE tunnels
 
 ## Quick Install and Run
 
-Run this on **each server** you want to participate (Iran or Abroad):
+Run this on **each server** you want to participate (Iran or Kharej):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ach1992/simple-gre/main/install.sh | sudo bash
@@ -55,11 +55,11 @@ sudo simple-gre
 
 ---
 
-## Recommended Workflow (Iran Hub → Multiple Abroad)
+## Recommended Workflow (Iran Hub → Multiple Kharej)
 
 ### 1) On the Iran server (Source)
 
-Create one tunnel per abroad server:
+Create one tunnel per Kharej server:
 
 1. Run:
    ```bash
@@ -89,13 +89,13 @@ DISABLE_RPFILTER=yes
 ----- END_COPY_BLOCK -----
 ```
 
-Repeat for each abroad server (each time you’ll get a different `TUN_NAME` and a different PAIR CODE unless you paste a block back).
+Repeat for each Kharej server (each time you’ll get a different `TUN_NAME` and a different PAIR CODE unless you paste a block back).
 
 ---
 
-### 2) On each Abroad server (Destination)
+### 2) On each Kharej server (Destination)
 
-For each abroad server, create **only its own tunnel**:
+For each Kharej server, create **only its own tunnel**:
 
 1. Run:
    ```bash
@@ -155,7 +155,7 @@ From the **Source (Iran)** side, ping the remote tunnel IP shown in menu Status/
 ping -c 3 10.X.Y.2
 ```
 
-From the **Destination (Abroad)** side:
+From the **Destination (Kharej)** side:
 
 ```bash
 ping -c 3 10.X.Y.1
