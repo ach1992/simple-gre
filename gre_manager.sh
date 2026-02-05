@@ -394,7 +394,7 @@ prompt_paste_copy_block() {
 prompt_role() {
   echo "Select server role:"
   echo "  1) Source (Iran)"
-  echo "  2) Destination (Abroad)"
+  echo "  2) Destination (Kharej)"
   local choice
   while true; do
     read -r -p "Enter choice [1-2]: " choice || true
@@ -611,7 +611,7 @@ do_edit() {
   local r inp
 
   echo "Current role: ${ROLE}"
-  read -r -p "Change role? (1=Source/Iran, 2=Destination/Abroad, Enter=keep): " r || true
+  read -r -p "Change role? (1=Source/Iran, 2=Destination/Kharej, Enter=keep): " r || true
   if [[ -n "${r:-}" ]]; then
     case "$r" in
       1) ROLE="source" ;;
