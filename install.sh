@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # =========================
-# Simple Gre Installer
+# Simple Gre Installer (Minimal / No-unneeded-updates)
 # Repo: https://github.com/ach1992/simple-gre
 # =========================
 
@@ -27,25 +27,51 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-apt_install_required() {
-  log "Installing required packages (Debian/Ubuntu)..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y curl iproute2 iputils-ping
-  ok "Required packages installed."
-}
+# Only install missing deps. Avoid apt-get update unless needed.
+install_missing_deps_if_possible() {
+  local missing=()
+  # For installer: curl required to download
+  have_cmd curl || missing+=("curl")
+  # For runtime: ip + ping required
+  have_cmd ip   || missing+=("iproute2")
+  have_cmd ping || missing+=("iputils-ping")
 
-apt_install_optional() {
-  export DEBIAN_FRONTEND=noninteractive
-  if ! have_cmd tcpdump; then
-    log "Installing optional package: tcpdump (best effort)"
-    if apt-get install -y tcpdump; then
-      ok "tcpdump installed."
-    else
-      warn "tcpdump could not be installed (optional). Skipping."
-      warn "If your apt is broken or /usr is read-only, fix it later; Simple Gre can still run."
-    fi
+  if ((${#missing[@]} == 0)); then
+    ok "All required commands are already installed. Skipping apt operations."
+    return 0
   fi
+
+  if ! have_cmd apt-get; then
+    err "apt-get not found. This installer supports Debian/Ubuntu."
+    err "Missing dependencies: ${missing[*]}"
+    err "Please install them manually and rerun installer."
+    return 1
+  fi
+
+  warn "Missing dependencies detected: ${missing[*]}"
+  warn "Attempting to install only missing packages (minimal changes)."
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  # Try install without apt-get update first (often avoids repo/DNS issues).
+  if apt-get install -y "${missing[@]}"; then
+    ok "Installed missing dependencies without apt-get update."
+    return 0
+  fi
+
+  warn "Install failed without apt-get update."
+  warn "Trying: apt-get update (best effort) then install missing packages..."
+
+  # Best effort update + install
+  if apt-get update -y && apt-get install -y "${missing[@]}"; then
+    ok "Installed missing dependencies after apt-get update."
+    return 0
+  fi
+
+  err "Could not install required dependencies automatically."
+  err "Please fix apt/network, then install manually:"
+  err "  apt-get update && apt-get install -y ${missing[*]}"
+  return 1
 }
 
 download_script() {
@@ -66,13 +92,7 @@ cleanup() { rm -rf "$TMP_DIR" >/dev/null 2>&1 || true; }
 main() {
   need_root
 
-  if ! have_cmd apt-get; then
-    err "This installer supports Debian/Ubuntu (apt-get not found)."
-    exit 1
-  fi
-
-  apt_install_required
-  apt_install_optional
+  install_missing_deps_if_possible
 
   download_script
   install_script
