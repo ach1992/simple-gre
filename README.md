@@ -2,8 +2,6 @@
 
 A simple **menu-driven** Bash script to create and manage **multiple GRE tunnels** between servers (Debian/Ubuntu, systemd).
 
-Repo: https://github.com/ach1992/simple-gre
-
 ---
 
 ## What’s New (Multi‑Tunnel)
