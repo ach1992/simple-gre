@@ -7,8 +7,8 @@ set -Eeuo pipefail
 # =========================
 
 REPO_RAW_BASE="https://raw.githubusercontent.com/ach1992/simple-gre/main"
-SCRIPT_NAME_IN_REPO="gre_manager.sh"     # <-- make sure your main script in repo has this name
-INSTALL_PATH="/usr/local/bin/simple-gre" # command name
+SCRIPT_NAME_IN_REPO="gre_manager.sh"
+INSTALL_PATH="/usr/local/bin/simple-gre"
 TMP_DIR="/tmp/simple-gre-install.$$"
 
 RED="\033[0;31m"; GRN="\033[0;32m"; YEL="\033[0;33m"; BLU="\033[0;34m"; NC="\033[0m"
@@ -27,12 +27,26 @@ need_root() {
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-install_deps() {
-  log "Installing dependencies (Debian/Ubuntu)..."
+apt_install_required() {
+  log "Installing required packages (Debian/Ubuntu)..."
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
-  apt-get install -y curl iproute2 iputils-ping tcpdump
-  ok "Dependencies installed."
+  apt-get install -y curl iproute2 iputils-ping
+  ok "Required packages installed."
+}
+
+apt_install_optional() {
+  # Optional tools for troubleshooting only
+  export DEBIAN_FRONTEND=noninteractive
+  if ! have_cmd tcpdump; then
+    log "Installing optional package: tcpdump (best effort)"
+    if apt-get install -y tcpdump; then
+      ok "tcpdump installed."
+    else
+      warn "tcpdump could not be installed (optional). Skipping."
+      warn "If your apt is broken or /usr is read-only, fix it later; Simple Gre can still run."
+    fi
+  fi
 }
 
 download_script() {
@@ -48,44 +62,30 @@ install_script() {
   ok "Installed."
 }
 
-verify() {
-  log "Verifying install..."
-  if [[ ! -x "${INSTALL_PATH}" ]]; then
-    err "Install failed: ${INSTALL_PATH} is not executable."
-    exit 1
-  fi
-  ok "Command available: simple-gre"
-  echo
-  echo "Run:"
-  echo "  sudo simple-gre"
-}
-
-cleanup() {
-  rm -rf "$TMP_DIR" >/dev/null 2>&1 || true
-}
+cleanup() { rm -rf "$TMP_DIR" >/dev/null 2>&1 || true; }
 
 main() {
   need_root
 
   if ! have_cmd apt-get; then
-    err "This installer currently supports Debian/Ubuntu (apt-get not found)."
+    err "This installer supports Debian/Ubuntu (apt-get not found)."
     exit 1
   fi
 
-  # Install deps if missing
-  if ! have_cmd curl || ! have_cmd ip || ! have_cmd ping; then
-    install_deps
-  else
-    # still ensure tcpdump exists (nice for troubleshooting)
-    if ! have_cmd tcpdump; then
-      install_deps
-    fi
-  fi
+  # Required deps
+  apt_install_required
+
+  # Optional deps (never fail install)
+  apt_install_optional
 
   download_script
   install_script
-  verify
   cleanup
+
+  ok "Installed successfully."
+  echo
+  echo "Run:"
+  echo "  sudo simple-gre"
 }
 
 main "$@"
