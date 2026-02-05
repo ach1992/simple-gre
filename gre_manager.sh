@@ -426,9 +426,8 @@ write_sysctl_persist() {
 # systemd + up/down scripts (shared)
 # -------------------------
 ensure_systemd_template() {
-  # Template service
-  if [[ ! -f "$SERVICE_TEMPLATE_FILE" ]]; then
-    cat >"$SERVICE_TEMPLATE_FILE" <<'EOF'
+  # Always (re)write template service + scripts to avoid stale legacy versions
+  cat >"$SERVICE_TEMPLATE_FILE" <<'EOF'
 [Unit]
 Description=Simple Gre - GRE Tunnel (%i)
 After=network-online.target
@@ -443,11 +442,8 @@ ExecStop=/usr/local/sbin/simple-gre-down %i
 [Install]
 WantedBy=multi-user.target
 EOF
-  fi
 
-  # Up script (parametric)
-  if [[ ! -f /usr/local/sbin/simple-gre-up ]]; then
-    cat >/usr/local/sbin/simple-gre-up <<'EOF'
+  cat >/usr/local/sbin/simple-gre-up <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -468,7 +464,6 @@ apply_sysctl() {
     sysctl --system >/dev/null 2>&1 || true
   fi
 
-  # Safety: never force-disable forwarding here if another tunnel needs it.
   if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   fi
@@ -503,12 +498,8 @@ create_tunnel() {
 apply_sysctl
 create_tunnel
 EOF
-    chmod +x /usr/local/sbin/simple-gre-up
-  fi
 
-  # Down script (parametric)
-  if [[ ! -f /usr/local/sbin/simple-gre-down ]]; then
-    cat >/usr/local/sbin/simple-gre-down <<'EOF'
+  cat >/usr/local/sbin/simple-gre-down <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -526,9 +517,8 @@ source "$CONF_FILE"
 ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip tunnel del "${TUN_NAME}" >/dev/null 2>&1 || true
 EOF
-    chmod +x /usr/local/sbin/simple-gre-down
-  fi
 
+  chmod +x /usr/local/sbin/simple-gre-up /usr/local/sbin/simple-gre-down
   systemctl daemon-reload
 }
 
