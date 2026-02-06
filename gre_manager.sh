@@ -199,11 +199,10 @@ print_copy_block() {
 prompt_paste_copy_block() {
   echo -e "${CYA}Optional:${NC} Paste COPY BLOCK now (press Enter to skip)."
   echo -e "Finish paste by pressing ${WHT}Enter TWICE${NC} on empty lines."
-  echo -e "${YEL}Example:${NC} Paste the block, then press Enter, then press Enter again."
   echo
 
   local first=""
-  read -r -p "Paste first line (or just Enter to skip): " first || true
+  read -r -p "Paste the COPY BLOCK (or just Enter to skip): " first || true
   if [[ -z "${first:-}" ]]; then
     return 0
   fi
