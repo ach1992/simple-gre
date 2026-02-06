@@ -44,14 +44,59 @@ A simple **menu-driven** Bash script to create and manage **multiple GRE tunnels
 
 ---
 
-## Quick Install and Run
+## Install & Run
 
-Run this on **each server** you want to participate (Iran or Kharej):
+There are **two supported** install modes:
+
+### 1) Online install / update (recommended)
+
+Use this when you want to **download the latest** installer and manager from GitHub:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ach1992/simple-gre/main/install.sh | sudo bash
 sudo simple-gre
 ```
+
+### 2) Offline / local install (no internet)
+
+Use this when you already have the files locally (copied to the server).
+
+**Folder structure**
+```text
+simple-gre/
+├─ install.sh
+├─ gre_manager.sh
+└─ README.md
+```
+
+**Install**
+```bash
+sudo bash install.sh
+sudo simple-gre
+```
+
+### Local file detected prompt (Local vs Download Latest)
+
+If `gre_manager.sh` exists next to `install.sh`, the installer will ask:
+
+- `[1] Use local file (offline)`
+- `[2] Download latest version (online)`
+
+Default is **[1] offline** (press Enter).
+
+> If you run via `curl | sudo bash`, the installer runs in **online mode** automatically.
+
+---
+
+## What gets installed / where files go
+
+- Main command:
+  - `/usr/local/bin/simple-gre`
+
+- Backup copy (kept for convenience):
+  - `/root/simple-gre/gre_manager.sh`
+  - If `install.sh` was run from a local file, it is also copied to:
+    - `/root/simple-gre/install.sh`
 
 ---
 
