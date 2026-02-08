@@ -525,24 +525,51 @@ enforce_iface_rpfilter() {
 
 # -------------------------
 # Firewall helpers (iptables + ufw) with HIGH priority
+# Supports iptables-nft and iptables-legacy automatically (plus default iptables)
 # -------------------------
-iptables_bin() {
-  if have_cmd iptables; then
-    echo iptables
-    return 0
-  fi
+
+iptables_bins() {
+  local b path
+  local -a bins=()
+  local -A seen=()
+
+  # Prefer explicit variants first, then generic iptables
+  for b in iptables-nft iptables-legacy iptables; do
+    if command -v "$b" >/dev/null 2>&1; then
+      path="$(command -v "$b" 2>/dev/null || true)"
+      [[ -n "$path" ]] || continue
+      if [[ -z "${seen[$path]:-}" ]]; then
+        seen["$path"]=1
+        bins+=("$b")
+      fi
+    fi
+  done
+
+  ((${#bins[@]})) || return 1
+  printf '%s\n' "${bins[@]}"
+}
+
+ipt_run() {
+  local ipt="$1"; shift
+  # Try xtables lock wait first (helps avoid race), fallback if unsupported
+  "$ipt" -w 2 "$@" >/dev/null 2>&1 && return 0
+  "$ipt" "$@" >/dev/null 2>&1 && return 0
   return 1
 }
 
 iptables_rule_ensure() {
   local table="$1"; shift
   local chain="$1"; shift
+
   local ipt
-  ipt="$(iptables_bin)" || return 0
-  if "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; then
-    return 0
-  fi
-  "$ipt" -t "$table" -I "$chain" 1 "$@" >/dev/null 2>&1 || true
+  while IFS= read -r ipt; do
+    # If exists, keep going (we want it present on each backend that exists)
+    if ipt_run "$ipt" -t "$table" -C "$chain" "$@"; then
+      continue
+    fi
+    # Insert at top (high priority)
+    ipt_run "$ipt" -t "$table" -I "$chain" 1 "$@" || true
+  done < <(iptables_bins 2>/dev/null || true)
 }
 
 ufw_is_active() {
@@ -561,14 +588,14 @@ apply_firewall_rules() {
   fi
 
   if [[ "$FIREWALL_MODE" == "auto" ]]; then
-    if ! ufw_is_active && ! have_cmd iptables; then
+    if ! ufw_is_active && ! have_cmd iptables && ! have_cmd iptables-nft && ! have_cmd iptables-legacy; then
       return 0
     fi
   fi
 
   [[ -n "${LOCAL_WAN_IP:-}" && -n "${REMOTE_WAN_IP:-}" && -n "${TUN_NAME:-}" ]] || return 0
 
-  # iptables (priority top)
+  # iptables (priority top) - GRE proto is 47
   iptables_rule_ensure filter INPUT  -p 47 -s "$REMOTE_WAN_IP" -d "$LOCAL_WAN_IP" -j ACCEPT
   iptables_rule_ensure filter OUTPUT -p 47 -s "$LOCAL_WAN_IP"  -d "$REMOTE_WAN_IP" -j ACCEPT
 
@@ -651,22 +678,46 @@ FIREWALL_MODE="${FIREWALL_MODE:-auto}"  # auto|yes|no
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-iptables_bin() {
-  if have_cmd iptables; then
-    echo iptables
-    return 0
-  fi
+# -------------------------
+# iptables helpers (support nft + legacy + default)
+# -------------------------
+iptables_bins() {
+  local b path
+  local -a bins=()
+  local -A seen=()
+
+  for b in iptables-nft iptables-legacy iptables; do
+    if command -v "$b" >/dev/null 2>&1; then
+      path="$(command -v "$b" 2>/dev/null || true)"
+      [[ -n "$path" ]] || continue
+      if [[ -z "${seen[$path]:-}" ]]; then
+        seen["$path"]=1
+        bins+=("$b")
+      fi
+    fi
+  done
+
+  ((${#bins[@]})) || return 1
+  printf '%s\n' "${bins[@]}"
+}
+
+ipt_run() {
+  local ipt="$1"; shift
+  "$ipt" -w 2 "$@" >/dev/null 2>&1 && return 0
+  "$ipt" "$@" >/dev/null 2>&1 && return 0
   return 1
 }
 
 iptables_rule_delete_all() {
   local table="$1"; shift
   local chain="$1"; shift
+
   local ipt
-  ipt="$(iptables_bin)" || return 0
-  while "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do
-    "$ipt" -t "$table" -D "$chain" "$@" >/dev/null 2>&1 || break
-  done
+  while IFS= read -r ipt; do
+    while ipt_run "$ipt" -t "$table" -C "$chain" "$@"; do
+      ipt_run "$ipt" -t "$table" -D "$chain" "$@" >/dev/null 2>&1 || break
+    done
+  done < <(iptables_bins 2>/dev/null || true)
 }
 
 ufw_is_active() {
@@ -684,7 +735,7 @@ cleanup_firewall_rules() {
     return 0
   fi
   if [[ "$FIREWALL_MODE" == "auto" ]]; then
-    if ! ufw_is_active && ! have_cmd iptables; then
+    if ! ufw_is_active && ! have_cmd iptables && ! have_cmd iptables-nft && ! have_cmd iptables-legacy; then
       return 0
     fi
   fi
