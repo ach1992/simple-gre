@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # =========================
-#  Simple Gre - GRE Manager (Multi Tunnel) - FINAL
+#  Simple Gre - GRE Manager (Multi Tunnel) - FINAL (+Firewall Priority)
 #  Repo: https://github.com/ach1992/simple-gre
 # =========================
 # Debian/Ubuntu friendly (systemd)
@@ -13,9 +13,12 @@ set -Eeuo pipefail
 # - Auto-generates PAIR CODE (10.X.Y) for each tunnel (/30)
 # - COPY BLOCK output per tunnel
 # - Fixes rp_filter + forwarding safely and persists via sysctl.d
+# - NEW: Per-tunnel firewall rules with HIGH priority (iptables + ufw)
 #
 # Notes:
-# - GRE requires IP protocol 47 allowed between public IPs.											   
+# - GRE requires IP protocol 47 allowed between public IPs.
+# - Firewall handling is per-tunnel and applied by simple-gre-up/down.
+# - For UFW, rules are inserted at top via `ufw insert 1 ...`.
 
 APP_DIR="/etc/simple-gre"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
@@ -193,6 +196,7 @@ print_copy_block() {
   echo "TTL=${TTL}"
   echo "ENABLE_FORWARDING=${ENABLE_FORWARDING}"
   echo "DISABLE_RPFILTER=${DISABLE_RPFILTER}"
+  echo "FIREWALL_MODE=${FIREWALL_MODE}"
   echo "----- END_COPY_BLOCK -----"
 }
 
@@ -244,6 +248,7 @@ prompt_paste_copy_block() {
       TTL) TTL="$val" ;;
       ENABLE_FORWARDING) ENABLE_FORWARDING="$val" ;;
       DISABLE_RPFILTER)  DISABLE_RPFILTER="$val" ;;
+      FIREWALL_MODE)     FIREWALL_MODE="$val" ;;
       *) : ;;
     esac
   done
@@ -280,6 +285,10 @@ prompt_paste_copy_block() {
     err "Pasted DISABLE_RPFILTER must be 'yes' or 'no'."
     return 1
   fi
+  if [[ -n "${FIREWALL_MODE:-}" ]] && [[ "$FIREWALL_MODE" != "auto" && "$FIREWALL_MODE" != "yes" && "$FIREWALL_MODE" != "no" ]]; then
+    err "Pasted FIREWALL_MODE must be 'auto', 'yes' or 'no'."
+    return 1
+  fi
 
   ok "COPY BLOCK parsed successfully."
   return 0
@@ -295,6 +304,9 @@ read_conf() {
   [[ -f "$f" ]] || return 1
   # shellcheck disable=SC1090
   source "$f"
+
+  # Backward compatible defaults
+  FIREWALL_MODE="${FIREWALL_MODE:-auto}"  # auto|yes|no
   return 0
 }
 
@@ -316,6 +328,7 @@ MTU="${MTU}"
 TTL="${TTL}"
 ENABLE_FORWARDING="${ENABLE_FORWARDING}"
 DISABLE_RPFILTER="${DISABLE_RPFILTER}"
+FIREWALL_MODE="${FIREWALL_MODE}"
 EOF
   chmod 600 "$f"
 }
@@ -421,7 +434,7 @@ write_sysctl_persist() {
 }
 
 # -------------------------
-# systemd template + up/down (ALWAYS overwrite to avoid stale legacy versions)
+# systemd template + up/down
 # -------------------------
 ensure_systemd_template() {
   cat >"$SERVICE_TEMPLATE_FILE" <<'EOF'
@@ -440,6 +453,9 @@ ExecStop=/usr/local/sbin/simple-gre-down %i
 WantedBy=multi-user.target
 EOF
 
+  # -------------------------
+  # simple-gre-up
+  # -------------------------
   cat >/usr/local/sbin/simple-gre-up <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -455,6 +471,10 @@ CONF_FILE="$TUNNELS_DIR/${tun}.conf"
 [[ -f "$CONF_FILE" ]] || { echo "Config not found: $CONF_FILE" >&2; exit 1; }
 # shellcheck disable=SC1090
 source "$CONF_FILE"
+
+FIREWALL_MODE="${FIREWALL_MODE:-auto}"  # auto|yes|no
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
 apply_sysctl() {
   if [[ -f "$SYSCTL_FILE" ]]; then
@@ -478,11 +498,122 @@ enforce_iface_rpfilter() {
   fi
 }
 
+# -------------------------
+# Firewall helpers (iptables + ufw) with HIGH priority
+# -------------------------
+iptables_bin() {
+  if have_cmd iptables; then
+    echo iptables
+    return 0
+  fi
+  return 1
+}
+
+iptables_rule_ensure() {
+  # usage: iptables_rule_ensure <table> <chain> <rule...>
+  local table="$1"; shift
+  local chain="$1"; shift
+  local ipt
+  ipt="$(iptables_bin)" || return 0
+
+  # check exists
+  if "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; then
+    return 0
+  fi
+  # insert at top for priority
+  "$ipt" -t "$table" -I "$chain" 1 "$@" >/dev/null 2>&1 || true
+}
+
+iptables_rule_delete_all() {
+  # usage: iptables_rule_delete_all <table> <chain> <rule...>
+  local table="$1"; shift
+  local chain="$1"; shift
+  local ipt
+  ipt="$(iptables_bin)" || return 0
+
+  while "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do
+    "$ipt" -t "$table" -D "$chain" "$@" >/dev/null 2>&1 || break
+  done
+}
+
+ufw_is_active() {
+  have_cmd ufw || return 1
+  ufw status 2>/dev/null | grep -qi "^Status: active" || return 1
+  return 0
+}
+
+ufw_insert_rule() {
+  # usage: ufw_insert_rule <rule...>
+  # Insert at top for priority; avoid duplicates by checking 'ufw status' is unreliable for exact match,
+  # so we try insert and ignore errors.
+  ufw insert 1 "$@" >/dev/null 2>&1 || true
+}
+
+ufw_delete_rule() {
+  # usage: ufw_delete_rule <rule...>
+  ufw --force delete "$@" >/dev/null 2>&1 || true
+}
+
+apply_firewall_rules() {
+  # Respect mode
+  if [[ "$FIREWALL_MODE" == "no" ]]; then
+    return 0
+  fi
+
+  # AUTO: apply only if ufw active OR iptables exists
+  if [[ "$FIREWALL_MODE" == "auto" ]]; then
+    if ! ufw_is_active && ! have_cmd iptables; then
+      return 0
+    fi
+  fi
+
+  # Validate minimal fields
+  [[ -n "${LOCAL_WAN_IP:-}" && -n "${REMOTE_WAN_IP:-}" && -n "${TUN_NAME:-}" ]] || return 0
+
+  # 1) iptables: high priority allow rules
+  # Allow GRE proto 47 between public IPs
+  iptables_rule_ensure filter INPUT  -p 47 -s "$REMOTE_WAN_IP" -d "$LOCAL_WAN_IP" -j ACCEPT
+  iptables_rule_ensure filter OUTPUT -p 47 -s "$LOCAL_WAN_IP"  -d "$REMOTE_WAN_IP" -j ACCEPT
+
+  # Allow tunnel interface traffic
+  iptables_rule_ensure filter INPUT  -i "$TUN_NAME" -j ACCEPT
+  iptables_rule_ensure filter OUTPUT -o "$TUN_NAME" -j ACCEPT
+
+  # Allow ICMP on tunnel interface (ping)
+  iptables_rule_ensure filter INPUT  -i "$TUN_NAME" -p icmp -j ACCEPT
+  iptables_rule_ensure filter OUTPUT -o "$TUN_NAME" -p icmp -j ACCEPT
+
+  # If forwarding enabled, allow forwarding on this interface
+  if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
+    iptables_rule_ensure filter FORWARD -i "$TUN_NAME" -j ACCEPT
+    iptables_rule_ensure filter FORWARD -o "$TUN_NAME" -j ACCEPT
+  fi
+
+  # 2) UFW (if active): insert allow rules at top priority
+  if ufw_is_active; then
+    # GRE proto
+    ufw_insert_rule allow proto gre from "$REMOTE_WAN_IP" to "$LOCAL_WAN_IP" comment "simple-gre ${tun} GRE-in"
+    ufw_insert_rule allow out proto gre to "$REMOTE_WAN_IP" comment "simple-gre ${tun} GRE-out"
+
+    # Allow all on tunnel interface (covers ping + data)
+    ufw_insert_rule allow in on "$TUN_NAME" comment "simple-gre ${tun} in-if"
+    ufw_insert_rule allow out on "$TUN_NAME" comment "simple-gre ${tun} out-if"
+
+    # Forwarding (route) if needed
+    if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
+      # Allow routed traffic coming from the tunnel
+      ufw_insert_rule route allow in on "$TUN_NAME" comment "simple-gre ${tun} route-in"
+      ufw_insert_rule route allow out on "$TUN_NAME" comment "simple-gre ${tun} route-out"
+    fi
+  fi
+}
+
 create_tunnel() {
   if ip link show "${TUN_NAME}" >/dev/null 2>&1; then
     ip link set "${TUN_NAME}" mtu "${MTU}" >/dev/null 2>&1 || true
     ip link set "${TUN_NAME}" up >/dev/null 2>&1 || true
     enforce_iface_rpfilter
+    apply_firewall_rules
     exit 0
   fi
 
@@ -491,12 +622,18 @@ create_tunnel() {
   ip addr add "${TUN_LOCAL_CIDR}" dev "${TUN_NAME}"
   ip link set "${TUN_NAME}" up
   enforce_iface_rpfilter
+
+  # Apply firewall rules after interface is up (so "on <ifname>" rules work)
+  apply_firewall_rules
 }
 
 apply_sysctl
 create_tunnel
 EOF
 
+  # -------------------------
+  # simple-gre-down
+  # -------------------------
   cat >/usr/local/sbin/simple-gre-down <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -511,6 +648,83 @@ CONF_FILE="$TUNNELS_DIR/${tun}.conf"
 [[ -f "$CONF_FILE" ]] || exit 0
 # shellcheck disable=SC1090
 source "$CONF_FILE"
+
+FIREWALL_MODE="${FIREWALL_MODE:-auto}"  # auto|yes|no
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+iptables_bin() {
+  if have_cmd iptables; then
+    echo iptables
+    return 0
+  fi
+  return 1
+}
+
+iptables_rule_delete_all() {
+  local table="$1"; shift
+  local chain="$1"; shift
+  local ipt
+  ipt="$(iptables_bin)" || return 0
+  while "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do
+    "$ipt" -t "$table" -D "$chain" "$@" >/dev/null 2>&1 || break
+  done
+}
+
+ufw_is_active() {
+  have_cmd ufw || return 1
+  ufw status 2>/dev/null | grep -qi "^Status: active" || return 1
+  return 0
+}
+
+ufw_delete_rule() {
+  ufw --force delete "$@" >/dev/null 2>&1 || true
+}
+
+cleanup_firewall_rules() {
+  if [[ "$FIREWALL_MODE" == "no" ]]; then
+    return 0
+  fi
+  if [[ "$FIREWALL_MODE" == "auto" ]]; then
+    if ! ufw_is_active && ! have_cmd iptables; then
+      return 0
+    fi
+  fi
+
+  [[ -n "${LOCAL_WAN_IP:-}" && -n "${REMOTE_WAN_IP:-}" && -n "${TUN_NAME:-}" ]] || return 0
+
+  # iptables cleanup
+  iptables_rule_delete_all filter INPUT  -p 47 -s "$REMOTE_WAN_IP" -d "$LOCAL_WAN_IP" -j ACCEPT
+  iptables_rule_delete_all filter OUTPUT -p 47 -s "$LOCAL_WAN_IP"  -d "$REMOTE_WAN_IP" -j ACCEPT
+
+  iptables_rule_delete_all filter INPUT  -i "$TUN_NAME" -j ACCEPT
+  iptables_rule_delete_all filter OUTPUT -o "$TUN_NAME" -j ACCEPT
+
+  iptables_rule_delete_all filter INPUT  -i "$TUN_NAME" -p icmp -j ACCEPT
+  iptables_rule_delete_all filter OUTPUT -o "$TUN_NAME" -p icmp -j ACCEPT
+
+  if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
+    iptables_rule_delete_all filter FORWARD -i "$TUN_NAME" -j ACCEPT
+    iptables_rule_delete_all filter FORWARD -o "$TUN_NAME" -j ACCEPT
+  fi
+
+  # UFW cleanup (best-effort)
+  if ufw_is_active; then
+    ufw_delete_rule allow proto gre from "$REMOTE_WAN_IP" to "$LOCAL_WAN_IP"
+    ufw_delete_rule allow out proto gre to "$REMOTE_WAN_IP"
+
+    ufw_delete_rule allow in on "$TUN_NAME"
+    ufw_delete_rule allow out on "$TUN_NAME"
+
+    if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
+      ufw_delete_rule route allow in on "$TUN_NAME"
+      ufw_delete_rule route allow out on "$TUN_NAME"
+    fi
+  fi
+}
+
+# Cleanup firewall first (so rules don't linger if interface name reused)
+cleanup_firewall_rules
 
 ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip tunnel del "${TUN_NAME}" >/dev/null 2>&1 || true
@@ -557,6 +771,8 @@ migrate_legacy_if_needed() {
     if [[ -z "${TUN_NAME:-}" ]] || ! is_ifname "${TUN_NAME:-}"; then
       TUN_NAME="$TUN_NAME_DEFAULT"
     fi
+
+    FIREWALL_MODE="${FIREWALL_MODE:-auto}"
 
     write_conf "$TUN_NAME"
     rm -f "$LEGACY_CONF_FILE" || true
@@ -710,6 +926,18 @@ prompt_tuning_keep() {
   return 0
 }
 
+prompt_firewall_mode_keep() {
+  local inp
+  FIREWALL_MODE="${FIREWALL_MODE:-auto}"
+  read -r -p "Manage firewall rules for this tunnel? [${FIREWALL_MODE}] (auto/yes/no): " inp || true
+  inp="${inp:-$FIREWALL_MODE}"
+  case "$inp" in
+    auto|yes|no) FIREWALL_MODE="$inp" ;;
+    *) err "Invalid value. Use auto/yes/no."; return 1 ;;
+  esac
+  return 0
+}
+
 # -------------------------
 # Actions
 # -------------------------
@@ -732,6 +960,7 @@ show_info_one() {
   echo "TTL:                 ${TTL:-N/A}"
   echo "IPv4 forwarding:     ${ENABLE_FORWARDING:-N/A}"
   echo "rp_filter disabled:  ${DISABLE_RPFILTER:-N/A}"
+  echo "Firewall mode:       ${FIREWALL_MODE:-auto}"
   echo "Config file:         $(conf_path_for "$tun")"
   echo "Sysctl file:         ${SYSCTL_FILE}"
   echo "Service:             $(service_for "$tun")"
@@ -770,6 +999,7 @@ do_create() {
   TTL="255"
   ENABLE_FORWARDING="yes"
   DISABLE_RPFILTER="yes"
+  FIREWALL_MODE="auto"
   PAIR_CODE=""
   LOCAL_WAN_IP=""
   REMOTE_WAN_IP=""
@@ -802,6 +1032,7 @@ do_create() {
 
   prompt_numbers_keep || return
   prompt_tuning_keep || return
+  prompt_firewall_mode_keep || return
 
   ensure_systemd_template
   write_conf "$TUN_NAME"
@@ -861,13 +1092,12 @@ do_edit() {
   fi
   recompute_tunnel_ips_from_pair || return
 
-  local prev_name="$TUN_NAME"
-
   prompt_tun_name_keep || return
   prompt_local_wan_ip_keep || return
   prompt_remote_wan_ip_keep || return
   prompt_numbers_keep || return
   prompt_tuning_keep || return
+  prompt_firewall_mode_keep || return
 
   if [[ "$TUN_NAME" != "$old_tun" ]]; then
     warn "Tunnel name changed: $old_tun -> $TUN_NAME"
