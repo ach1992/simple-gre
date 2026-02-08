@@ -2,29 +2,17 @@
 set -Eeuo pipefail
 
 # =========================
-#  Simple Gre - GRE Manager (Multi Tunnel) - FINAL (+Firewall Priority)
-#  Repo: https://github.com/ach1992/simple-gre
+#  Simple Gre - GRE Manager (Multi Tunnel)
 # =========================
-# Debian/Ubuntu friendly (systemd)
-# Features:
-# - Create/Edit/Status/Info/Delete MULTIPLE GRE tunnels
-# - Per-tunnel config files in /etc/simple-gre/tunnels.d/<tun>.conf
-# - systemd template service: simple-gre@<tun>.service
-# - Auto-generates PAIR CODE (10.X.Y) for each tunnel (/30)
-# - COPY BLOCK output per tunnel
-# - Fixes rp_filter + forwarding safely and persists via sysctl.d
-# - NEW: Per-tunnel firewall rules with HIGH priority (iptables + ufw)
-#
-# Notes:
-# - GRE requires IP protocol 47 allowed between public IPs.
-# - Firewall handling is per-tunnel and applied by simple-gre-up/down.
-# - For UFW, rules are inserted at top via `ufw insert 1 ...`.
 
 APP_DIR="/etc/simple-gre"
 TUNNELS_DIR="$APP_DIR/tunnels.d"
 LEGACY_CONF_FILE="$APP_DIR/gre.conf"
 SYSCTL_FILE="$APP_DIR/99-simple-gre.conf"
+
 SERVICE_TEMPLATE_FILE="/etc/systemd/system/simple-gre@.service"
+CHECK_SERVICE_TEMPLATE_FILE="/etc/systemd/system/simple-gre-check@.service"
+CHECK_TIMER_TEMPLATE_FILE="/etc/systemd/system/simple-gre-check@.timer"
 
 TUN_NAME_DEFAULT="gre1"
 
@@ -103,6 +91,16 @@ conf_path_for() {
 service_for() {
   local tun="$1"
   echo "simple-gre@${tun}.service"
+}
+
+check_timer_for() {
+  local tun="$1"
+  echo "simple-gre-check@${tun}.timer"
+}
+
+check_service_for() {
+  local tun="$1"
+  echo "simple-gre-check@${tun}.service"
 }
 
 tunnel_exists_in_conf() {
@@ -305,7 +303,6 @@ read_conf() {
   # shellcheck disable=SC1090
   source "$f"
 
-  # Backward compatible defaults
   FIREWALL_MODE="${FIREWALL_MODE:-auto}"  # auto|yes|no
   return 0
 }
@@ -434,9 +431,10 @@ write_sysctl_persist() {
 }
 
 # -------------------------
-# systemd template + up/down
+# systemd template + up/down + check timer
 # -------------------------
 ensure_systemd_template() {
+  # main tunnel service template
   cat >"$SERVICE_TEMPLATE_FILE" <<'EOF'
 [Unit]
 Description=Simple Gre - GRE Tunnel (%i)
@@ -451,6 +449,34 @@ ExecStop=/usr/local/sbin/simple-gre-down %i
 
 [Install]
 WantedBy=multi-user.target
+EOF
+
+  # healthcheck service (runs simple-gre-up idempotently)
+  cat >"$CHECK_SERVICE_TEMPLATE_FILE" <<'EOF'
+[Unit]
+Description=Simple Gre - GRE Healthcheck (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/simple-gre-up %i
+EOF
+
+  # healthcheck timer (every 60 seconds)
+  cat >"$CHECK_TIMER_TEMPLATE_FILE" <<'EOF'
+[Unit]
+Description=Simple Gre - GRE Healthcheck Timer (%i)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=true
+Unit=simple-gre-check@%i.service
+
+[Install]
+WantedBy=timers.target
 EOF
 
   # -------------------------
@@ -481,7 +507,6 @@ apply_sysctl() {
     sysctl --system >/dev/null 2>&1 || true
   fi
 
-  # Never force-disable forwarding here; only enable if this tunnel needs it.
   if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
     sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   fi
@@ -510,30 +535,14 @@ iptables_bin() {
 }
 
 iptables_rule_ensure() {
-  # usage: iptables_rule_ensure <table> <chain> <rule...>
   local table="$1"; shift
   local chain="$1"; shift
   local ipt
   ipt="$(iptables_bin)" || return 0
-
-  # check exists
   if "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; then
     return 0
   fi
-  # insert at top for priority
   "$ipt" -t "$table" -I "$chain" 1 "$@" >/dev/null 2>&1 || true
-}
-
-iptables_rule_delete_all() {
-  # usage: iptables_rule_delete_all <table> <chain> <rule...>
-  local table="$1"; shift
-  local chain="$1"; shift
-  local ipt
-  ipt="$(iptables_bin)" || return 0
-
-  while "$ipt" -t "$table" -C "$chain" "$@" >/dev/null 2>&1; do
-    "$ipt" -t "$table" -D "$chain" "$@" >/dev/null 2>&1 || break
-  done
 }
 
 ufw_is_active() {
@@ -543,92 +552,81 @@ ufw_is_active() {
 }
 
 ufw_insert_rule() {
-  # usage: ufw_insert_rule <rule...>
-  # Insert at top for priority; avoid duplicates by checking 'ufw status' is unreliable for exact match,
-  # so we try insert and ignore errors.
   ufw insert 1 "$@" >/dev/null 2>&1 || true
 }
 
-ufw_delete_rule() {
-  # usage: ufw_delete_rule <rule...>
-  ufw --force delete "$@" >/dev/null 2>&1 || true
-}
-
 apply_firewall_rules() {
-  # Respect mode
   if [[ "$FIREWALL_MODE" == "no" ]]; then
     return 0
   fi
 
-  # AUTO: apply only if ufw active OR iptables exists
   if [[ "$FIREWALL_MODE" == "auto" ]]; then
     if ! ufw_is_active && ! have_cmd iptables; then
       return 0
     fi
   fi
 
-  # Validate minimal fields
   [[ -n "${LOCAL_WAN_IP:-}" && -n "${REMOTE_WAN_IP:-}" && -n "${TUN_NAME:-}" ]] || return 0
 
-  # 1) iptables: high priority allow rules
-  # Allow GRE proto 47 between public IPs
+  # iptables (priority top)
   iptables_rule_ensure filter INPUT  -p 47 -s "$REMOTE_WAN_IP" -d "$LOCAL_WAN_IP" -j ACCEPT
   iptables_rule_ensure filter OUTPUT -p 47 -s "$LOCAL_WAN_IP"  -d "$REMOTE_WAN_IP" -j ACCEPT
 
-  # Allow tunnel interface traffic
   iptables_rule_ensure filter INPUT  -i "$TUN_NAME" -j ACCEPT
   iptables_rule_ensure filter OUTPUT -o "$TUN_NAME" -j ACCEPT
 
-  # Allow ICMP on tunnel interface (ping)
   iptables_rule_ensure filter INPUT  -i "$TUN_NAME" -p icmp -j ACCEPT
   iptables_rule_ensure filter OUTPUT -o "$TUN_NAME" -p icmp -j ACCEPT
 
-  # If forwarding enabled, allow forwarding on this interface
   if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
     iptables_rule_ensure filter FORWARD -i "$TUN_NAME" -j ACCEPT
     iptables_rule_ensure filter FORWARD -o "$TUN_NAME" -j ACCEPT
   fi
 
-  # 2) UFW (if active): insert allow rules at top priority
+  # UFW (priority top)
   if ufw_is_active; then
-    # GRE proto
     ufw_insert_rule allow proto gre from "$REMOTE_WAN_IP" to "$LOCAL_WAN_IP" comment "simple-gre ${tun} GRE-in"
     ufw_insert_rule allow out proto gre to "$REMOTE_WAN_IP" comment "simple-gre ${tun} GRE-out"
 
-    # Allow all on tunnel interface (covers ping + data)
     ufw_insert_rule allow in on "$TUN_NAME" comment "simple-gre ${tun} in-if"
     ufw_insert_rule allow out on "$TUN_NAME" comment "simple-gre ${tun} out-if"
 
-    # Forwarding (route) if needed
     if [[ "${ENABLE_FORWARDING:-no}" == "yes" ]]; then
-      # Allow routed traffic coming from the tunnel
       ufw_insert_rule route allow in on "$TUN_NAME" comment "simple-gre ${tun} route-in"
       ufw_insert_rule route allow out on "$TUN_NAME" comment "simple-gre ${tun} route-out"
     fi
   fi
 }
 
-create_tunnel() {
+ensure_addr_present() {
+  # if addr missing (someone deleted IP), re-add it
+  if ! ip -4 addr show dev "$TUN_NAME" 2>/dev/null | grep -qF " ${TUN_LOCAL_CIDR}"; then
+    ip addr add "${TUN_LOCAL_CIDR}" dev "${TUN_NAME}" >/dev/null 2>&1 || true
+  fi
+}
+
+create_or_fix_tunnel() {
   if ip link show "${TUN_NAME}" >/dev/null 2>&1; then
+    # Bring up and ensure address + firewall
     ip link set "${TUN_NAME}" mtu "${MTU}" >/dev/null 2>&1 || true
     ip link set "${TUN_NAME}" up >/dev/null 2>&1 || true
+    ensure_addr_present
     enforce_iface_rpfilter
     apply_firewall_rules
     exit 0
   fi
 
+  # create fresh
   ip tunnel add "${TUN_NAME}" mode gre local "${LOCAL_WAN_IP}" remote "${REMOTE_WAN_IP}" ttl "${TTL}"
   ip link set "${TUN_NAME}" mtu "${MTU}"
   ip addr add "${TUN_LOCAL_CIDR}" dev "${TUN_NAME}"
   ip link set "${TUN_NAME}" up
   enforce_iface_rpfilter
-
-  # Apply firewall rules after interface is up (so "on <ifname>" rules work)
   apply_firewall_rules
 }
 
 apply_sysctl
-create_tunnel
+create_or_fix_tunnel
 EOF
 
   # -------------------------
@@ -693,7 +691,6 @@ cleanup_firewall_rules() {
 
   [[ -n "${LOCAL_WAN_IP:-}" && -n "${REMOTE_WAN_IP:-}" && -n "${TUN_NAME:-}" ]] || return 0
 
-  # iptables cleanup
   iptables_rule_delete_all filter INPUT  -p 47 -s "$REMOTE_WAN_IP" -d "$LOCAL_WAN_IP" -j ACCEPT
   iptables_rule_delete_all filter OUTPUT -p 47 -s "$LOCAL_WAN_IP"  -d "$REMOTE_WAN_IP" -j ACCEPT
 
@@ -708,7 +705,6 @@ cleanup_firewall_rules() {
     iptables_rule_delete_all filter FORWARD -o "$TUN_NAME" -j ACCEPT
   fi
 
-  # UFW cleanup (best-effort)
   if ufw_is_active; then
     ufw_delete_rule allow proto gre from "$REMOTE_WAN_IP" to "$LOCAL_WAN_IP"
     ufw_delete_rule allow out proto gre to "$REMOTE_WAN_IP"
@@ -723,9 +719,7 @@ cleanup_firewall_rules() {
   fi
 }
 
-# Cleanup firewall first (so rules don't linger if interface name reused)
 cleanup_firewall_rules
-
 ip link set "${TUN_NAME}" down >/dev/null 2>&1 || true
 ip tunnel del "${TUN_NAME}" >/dev/null 2>&1 || true
 EOF
@@ -739,6 +733,11 @@ enable_service_for_tunnel() {
   systemctl enable "$(service_for "$tun")" >/dev/null 2>&1 || true
 }
 
+enable_check_timer_for_tunnel() {
+  local tun="$1"
+  systemctl enable --now "$(check_timer_for "$tun")" >/dev/null 2>&1 || true
+}
+
 apply_now_tunnel() {
   local tun="$1"
   systemctl restart "$(service_for "$tun")" >/dev/null 2>&1 || true
@@ -748,6 +747,12 @@ stop_disable_tunnel_service() {
   local tun="$1"
   systemctl stop "$(service_for "$tun")" >/dev/null 2>&1 || true
   systemctl disable "$(service_for "$tun")" >/dev/null 2>&1 || true
+}
+
+stop_disable_check_timer() {
+  local tun="$1"
+  systemctl disable --now "$(check_timer_for "$tun")" >/dev/null 2>&1 || true
+  systemctl stop "$(check_service_for "$tun")" >/dev/null 2>&1 || true
 }
 
 # -------------------------
@@ -780,6 +785,7 @@ migrate_legacy_if_needed() {
     ensure_systemd_template
     write_sysctl_persist
     enable_service_for_tunnel "$TUN_NAME"
+    enable_check_timer_for_tunnel "$TUN_NAME"
     apply_now_tunnel "$TUN_NAME"
 
     ok "Migration completed. Tunnel '${TUN_NAME}' is now managed as simple-gre@${TUN_NAME}.service"
@@ -964,6 +970,7 @@ show_info_one() {
   echo "Config file:         $(conf_path_for "$tun")"
   echo "Sysctl file:         ${SYSCTL_FILE}"
   echo "Service:             $(service_for "$tun")"
+  echo "Healthcheck timer:   $(check_timer_for "$tun") (60s)"
   echo
 
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
@@ -993,7 +1000,6 @@ do_create() {
   prompt_role
   echo
 
-  # Defaults
   TUN_NAME=""
   MTU="1476"
   TTL="255"
@@ -1038,9 +1044,10 @@ do_create() {
   write_conf "$TUN_NAME"
   write_sysctl_persist
   enable_service_for_tunnel "$TUN_NAME"
+  enable_check_timer_for_tunnel "$TUN_NAME"
   apply_now_tunnel "$TUN_NAME"
 
-  ok "Tunnel '${TUN_NAME}' created and persisted (systemd)."
+  ok "Tunnel '${TUN_NAME}' created and persisted (systemd). Healthcheck every 60s is enabled."
   echo
   echo -e "${GRN}Tunnel addressing:${NC}"
   echo "  PAIR CODE:          ${PAIR_CODE}"
@@ -1101,7 +1108,8 @@ do_edit() {
 
   if [[ "$TUN_NAME" != "$old_tun" ]]; then
     warn "Tunnel name changed: $old_tun -> $TUN_NAME"
-    warn "Stopping old service + removing old interface if present..."
+    warn "Stopping old service + old timer + removing old interface if present..."
+    stop_disable_check_timer "$old_tun"
     stop_disable_tunnel_service "$old_tun"
     ip link set "$old_tun" down >/dev/null 2>&1 || true
     ip tunnel del "$old_tun" >/dev/null 2>&1 || true
@@ -1112,9 +1120,10 @@ do_edit() {
   write_conf "$TUN_NAME"
   write_sysctl_persist
   enable_service_for_tunnel "$TUN_NAME"
+  enable_check_timer_for_tunnel "$TUN_NAME"
   apply_now_tunnel "$TUN_NAME"
 
-  ok "Tunnel '${TUN_NAME}' updated and applied."
+  ok "Tunnel '${TUN_NAME}' updated and applied. Healthcheck every 60s is enabled."
   echo
   echo -e "${CYA}COPY BLOCK (paste on the other server):${NC}"
   print_copy_block
@@ -1137,6 +1146,10 @@ do_status_one() {
   systemctl --no-pager --full status "$(service_for "$tun")" || true
   echo
 
+  echo -e "${WHT}Healthcheck Timer:${NC}"
+  systemctl --no-pager --full status "$(check_timer_for "$tun")" || true
+  echo
+
   echo -e "${WHT}Interface:${NC}"
   if ! ip -d link show "$TUN_NAME" >/dev/null 2>&1; then
     err "Tunnel interface not found. Try restarting service."
@@ -1156,7 +1169,6 @@ do_status_one() {
   echo -e "${WHT}Counters:${NC}"
   ip -s link show "$TUN_NAME" || true
   echo
-
   echo -e "${WHT}Connectivity test:${NC} ping remote tunnel IP (${TUN_REMOTE_IP})"
   if ping -c 3 -W 2 "$TUN_REMOTE_IP" >/dev/null 2>&1; then
     ok "Ping successful. Tunnel looks UP and reachable."
@@ -1174,7 +1186,8 @@ do_status_all() {
     found="yes"
     echo -e "${CYA}--- $t ---${NC}"
     if read_conf "$t"; then
-      systemctl --no-pager --full status "$(service_for "$t")" | sed -n '1,12p' || true
+      systemctl --no-pager --full status "$(service_for "$t")" | sed -n '1,10p' || true
+      systemctl --no-pager --full status "$(check_timer_for "$t")" | sed -n '1,10p' || true
       if ip link show "$t" >/dev/null 2>&1; then
         ip -4 -o addr show dev "$t" 2>/dev/null || true
       else
@@ -1209,7 +1222,7 @@ do_delete() {
     return
   fi
 
-  warn "This will remove tunnel '$tun', its systemd service instance, and its config."
+  warn "This will remove tunnel '$tun', its systemd service, its healthcheck timer, and its config."
   local yn
   read -r -p "Are you sure? [y/N]: " yn || true
   yn="${yn:-N}"
@@ -1218,6 +1231,7 @@ do_delete() {
     return
   fi
 
+  stop_disable_check_timer "$tun"
   stop_disable_tunnel_service "$tun"
   rm -f "$(conf_path_for "$tun")" || true
 
