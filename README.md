@@ -256,9 +256,9 @@ If nothing appears, GRE is blocked in the path/provider/firewall.
 
 If you see packet loss under load, try lowering MTU (example):
 
-- 1476 (default)
-- 1450
-- 1400
+- 1345 (default)
+- 1300
+- 1280
 
 Edit the tunnel via menu and apply.
 
