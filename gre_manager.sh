@@ -1052,7 +1052,7 @@ do_create() {
   echo
 
   TUN_NAME=""
-  MTU="1476"
+  MTU="1345"
   TTL="255"
   ENABLE_FORWARDING="yes"
   DISABLE_RPFILTER="yes"
